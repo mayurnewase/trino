@@ -81,9 +81,6 @@ Connector Arch: SPI (Service Provider Interface)
             to fetch data from data source using connector
             then passed to trino in form of pages
 
-
-    
-
 -------
 
 Catalogs, Schemas, and Tables
@@ -124,7 +121,7 @@ Query execution model
 
         query plan converted to distributed query plan
         distributed query plan defines the stages and the way to execute those on workers
-        state consists of tasks
+        stage consists of tasks
         each task processes a piece of data is called split
         split is descriptor of underlying data that can be retieved and processed by worker
             it is unit of parallelism and work assignment.
