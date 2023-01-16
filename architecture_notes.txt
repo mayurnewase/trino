@@ -1,0 +1,394 @@
+Directories
+
+lib
+    Contains the Java archives (JARs) that make up the Trino server and all required
+    dependencies.
+plugins
+    Contains the Trino plug-ins and their dependencies, in separate directories for
+    each plug-in. Trino includes many plug-ins by default, and third-party plug-ins
+    can be added as well. Trino allows for pluggable components to integrate with
+    Trino, such as connectors, functions, and security access controls.
+bin
+    Contains launch scripts for Trino. These scripts are used to start, stop, restart,
+kill, and get the status of a running Trino process. Learn more about the use of
+these scripts in “Launcher” on page 83.
+
+etc -> testing/trino-server-dev/etc
+    This is the configuration directory. It is created by the user and provides the
+necessary configuration files needed by Trino. You can find out more about the
+configuration in “Configuration Details” on page 79.
+
+var
+    Finally, this is a data directory, the place where logs are stored. It is created the
+first time the Trino server is launched. By default, it is located in the installation
+directory. We recommend configuring it outside the installation directory to
+allow for the data to be preserved across upgrades.
+
+----
+
+Concepts
+
+connector:
+    Adapts Trino to a data source. Every catalog is associated with a specific
+connector.
+
+Catalog:
+    Defines details for accessing a data source; contains schemas and configures a
+specific connector to use.
+
+Schema:
+    A way to organize tables. A catalog and schema together define a set of tables that
+can be queried.
+
+Table:
+    A set of unordered rows, which are organized into named columns with data
+types.
+
+
+-----
+
+Connector Arch: SPI (Service Provider Interface)
+    defines the functionality a connector has to implement for specific features.
+    
+    Trino connectors are plug-ins loaded by each server at startup. They are configured
+        by specific parameters in the catalog properties files and loaded from the plug-ins
+        directory
+
+    ref: core/trino-spi/src/main/java/io/trino/spi/connector/Connector.java
+
+    it should implement
+        Operations to fetch table/view/schema metadata
+        
+        Operations to produce logical units of data partitioning, so that Trino can paral‐
+            lelize reads and writes
+        
+        Data sources and sinks that convert the source data to/from the in-memory
+            format expected by the query engine
+
+    SPI mainly includes
+        medatadata SPI: used by by co-ordinator
+            used by coord to get info about tables, cols, types
+            used to validate the query.
+
+        data statistics SPI: used by by co-ordinator
+            used by coord to get row counts and table sizes for cost based optimization on the query
+
+        data location SPI: used by by co-ordinator
+            used to create distributed query plan
+            and generate logical splits of table contents.
+
+        data stream SPI: used by by source tasks
+            to fetch data from data source using connector
+            then passed to trino in form of pages
+
+
+    
+
+-------
+
+Catalogs, Schemas, and Tables
+    connector 1:1 catalog
+    catalog 1:many schemas
+    schemas 1: many tables
+
+    Each catalog configuration uses a connector to access a specific data
+    source. The data source exposes one or more schemas in the catalog. Each schema
+    contains tables that provide the data in table rows, with columns using different data
+   
+--------
+Query execution model
+    ref: trino/core/trino-main/src/main/java/io/trino/sql/planner/QueryPlanner.java
+
+    steps:
+        coordinator receives text query from CLI or JDBC/ODBC drivers or client libs
+        parses it
+        analyze it
+        plans and optimize it
+        triggers workers to get data from sources
+        create result data set
+        make it available to client
+
+
+
+    query planner's core components are:
+        Analysis
+        Session 
+        Plan node allocator
+        planner context
+        relation plan
+        subqueryplanner
+
+    hierararchy and splits of the query as below
+        datasource is upstream
+        user is downstream
+
+        query plan converted to distributed query plan
+        distributed query plan defines the stages and the way to execute those on workers
+        state consists of tasks
+        each task processes a piece of data is called split
+        split is descriptor of underlying data that can be retieved and processed by worker
+            it is unit of parallelism and work assignment.
+
+        coord assigns tasks to workers
+
+        pages:
+            tasks at the source stage prodce data called pages
+                which are collection of rows in columnar format
+                pages flow to next downstream stages using exchange operators
+                exchange operators read data from task within an upstream stage
+
+        exchange operators:
+            operator process data and give output to downstream operator
+            operator examples are tables scans, filters, joins, aggregations. 
+
+
+        pipeline:
+            sequence of exchange operators in a task is called pipeline
+            last opertor of pipeline puts its output in task output buffer
+            so exchange operator of downstream task consume the op output buffer of upstream task
+            this happens parallally
+
+        driver:
+            after task is created it instantiates a driver for each split
+            so each driver is instantiation of pipeline of operators and performs processing of data in the split
+            task may contain multiple drivers, so once all drivers are finished data is passed to next task.
+                and drivers and tasks are destroyed
+            
+------
+
+parsing and analyzing
+    validates the query
+    next is query planning
+
+
+Query planning
+
+    example query
+        SELECT
+            (SELECT name FROM region r WHERE regionkey = n.regionkey) AS region_name,
+            n.name AS nation_name,
+            sum(totalprice) orders_sum
+        FROM nation n, orders o, customer c
+        WHERE n.nationkey = c.nationkey
+        AND c.custkey = o.custkey
+        GROUP BY n.nationkey, regionkey, n.name
+        ORDER BY orders_sum DESC
+        LIMIT 5;
+
+    simplest query plan
+        - Limit[5]
+            - Sort[orders_sum DESC]
+                - LateralJoin[2]
+                - Aggregate[by nationkey...; orders_sum := sum(totalprice)]
+                    - Filter[c.nationkey = n.nationkey AND c.custkey = o.custkey]
+                    - CrossJoin
+                        - CrossJoin
+                            - TableScan[nation]
+                            - TableScan[orders]
+                        - TableScan[customer]
+                - EnforceSingleRow[region_name := r.name]
+                    - Filter[r.regionkey = n.regionkey]
+                        - TableScan[region]
+
+    program that produces the result
+    query planner and optimizer participate to generate the plan
+
+    plan is tree, execution starts from leaf node procededs up the structure
+
+
+------
+
+Optimization rules
+
+    optimizer which uses below tricks is called syntactic optimizer
+    because it only considers the query syntax
+
+    1. Predicate Pushdown:
+        move filtering conditions closer to the source of data
+        transforms Filter in simple filter and inner join into cross join
+        
+        - Aggregate[by nationkey...; orders_sum := sum(totalprice)]
+            - Filter[c.nationkey = n.nationkey]  // transformed simpler filter
+                - InnerJoin[o.custkey = c.custkey]  // added inner join
+                    - CrossJoin
+                        - TableScan[nation]
+                        - TableScan[orders]
+                    - TableScan[customer]
+
+        it couldn't improve cross join between nation and order as there was no immediate condition joiining these tables
+        so next optimization comes into play
+
+    2. Cross Join Elimination:
+        in absense of cost based optimizer, trino joins table in select query in the order it appears in the query text
+        with 1 exception, if there is no join condition then it results in cross join
+        in almost all cases cross join is unwanted
+
+        this optimization eliminates the crossjoin by reordering the tables being joined to minimize the number of cross joins
+        if relative table sizes info is not present, other than cross join elimination table join order is preserved.
+
+
+        - Aggregate[by nationkey...; orders_sum := sum(totalprice)]
+            - InnerJoin[c.custkey = o.custkey]   // reordered to custkey first
+                - InnerJoin[n.nationkey = c.nationkey] // then nationkey
+                    - TableScan[nation]
+                    - TableScan[customer]
+                - TableScan[orders]
+
+    3. Top N:
+        limit clause is always preceded by order clause, without it SQL doesn't guarantee the rows returned
+        trino could sort all rows produced and then just retain the first few of them according to limit clause
+        but its not optimal, so it instead it uses TopN node plan
+        which during query execution keeps desired number of rows in head data structure
+        and keep it updating while reading the input data in a streaming fashion
+
+    4. Partial Aggregations:
+        trino in the above query doesn't need to pass all rows from order table to join
+        because we not into all orders, just an aggregate sum of totalprice for each nation
+        so this optimization reduce the data flowing into downstream join by aggregating it.
+        results are not complete so this is called partial aggregations
+
+        - Aggregate[by nationkey...; orders_sum := sum(totalprice)]
+            - InnerJoin[c.custkey = o.custkey]
+                - InnerJoin[n.nationkey = c.nationkey]
+                    - TableScan[nation]
+                    - TableScan[customer]
+                - Aggregate[by custkey; totalprice := sum(totalprice)]
+                    - TableScan[orders]
+
+
+
+    5. lateral join deorrelation:
+        trino decorrelates the subquery into normal left join
+        so query
+            SELECT
+                (SELECT name FROM region r WHERE regionkey = n.regionkey)
+                AS region_name,
+            n.name AS nation_name
+            FROM nation n
+
+        changes into
+            SELECT
+                r.name AS region_name,
+                n.name AS nation_name
+            FROM nation n LEFT OUTER JOIN region r ON r.regionkey = n.regionkey
+
+        but first query fails if there are duplicate entries in region table
+        second doesn't, so this needs additional check like numbering all source rows and if any duplicate is found fail the query
+        as original
+
+        - TopN[5; orders_sum DESC]
+            - MarkDistinct & Check
+                - LeftJoin[n.regionkey = r.regionkey]
+                    - AssignUniqueId
+                    - Aggregate[by nationkey...; orders_sum := sum(totalprice)]
+                    - ...
+                - TableScan[region]
+
+
+---------
+Cost based optimizer
+
+    Cost: CPU time + Memory requirements + network bandwidth
+
+    syntactic optimizer only considers query syntax to generate query plan
+    cost based optimizer ensures multiple variants of same query produce same
+        optimal query plan for trino-engine to process
+
+
+    exmaple query:
+        SELECT
+            n.name AS nation_name,
+            avg(extendedprice) as avg_price
+        FROM nation n, orders o, customer c, lineitem l
+        WHERE  n.nationkey = c.nationkey
+            AND c.custkey = o.custkey
+            AND o.orderkey = l.orderkey
+        GROUP BY n.nationkey, n.name
+        ORDER BY nation_name;
+           
+    now above optimizer will generate below plan for it
+
+        - Aggregate[by nationkey...; orders_sum := sum(totalprice)]
+            - InnerJoin[o.orderkey = l.orderkey]
+                - InnerJoin[c.custkey = o.custkey]
+                    - InnerJoin[n.nationkey = c.nationkey]
+                        - TableScan[nation]
+                        - TableScan[customer]
+                    - TableScan[orders]
+                - TableScan[lineitem]
+           
+    now if just change the order of conditions in where clause this plan will also change
+    and will also affect query performance which isn't ideal
+
+
+    Optimizers involved:
+        1. cost of the join: while joining tables with "=" condition, trino implements 
+            extended version of algo called "hash join"
+            it uses 3 level hashing to parallelize processing
+
+        2 table statistics: gets table info from the connector for data sources
+            and determine optimal ordering of the tables in the query.
+
+        3. filter statistics: 
+        4. table statistics for partitioned tables: 
+        5. join enumeration: 
+        6. broadcast vs distributed joins:
+
+
+--------
+
+Checking table statistics:
+    
+    trino gives "analyze" command to collect stats for a connector, and stores in a hive metastore
+    
+    syntax is 
+        >> "analyze table_name [with (property_name = expression [,...])]"
+    
+    example:
+        >> analyze datalake.ontime.flights;
+
+display table statistics:
+    >> "show stats for datalake.ontime.flights"
+
+
+------
+
+Connectors:
+    connector takes the processed query from trino and gives it to the data source and get results
+    and passes it back to trino.
+
+    to configure add a catalog in etc/catalog/ which needs a connector name
+    sometimes connector can directly push down the entire query to the datasource
+    but it has few limits
+    e.g in postgresql connector for query
+        
+        select state, count(*) from airport where country=US group state;
+        
+        connector pushes down this query
+            select state from airport where country=us;
+
+            and does the aggregation on Trino to take advantage of distributed compute which postgresql doesn't have
+
+        if you wanna push down entire queries to the postgresql, create view on postgresql and its exposed to trino as a table
+        then trino pushes down whole query.
+
+
+    Iceberg connector is very feature rich, so check that out.
+
+-------
+
+Query Federation
+
+    use fully qualified name for sources like
+        catalog + schema + table name
+
+
+----- 
+    Sql in Trino: not needed for now
+        includes function and operators
+        lambda, aggregate functions
+        geospatial functions and prepared statements
+
+
+
+

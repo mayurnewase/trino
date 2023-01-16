@@ -1,0 +1,15 @@
+compile
+./mvnw clean install -DskipTests
+
+start tpch query runner
+
+/usr/bin/env /usr/lib/jvm/openjdk-18/jdk-18.0.2.1/bin/java @/tmp/cp_dzvdtgvyxd4szi5bz7txliu1x.argfile io.trino.tests.tpch.TpchQueryRunner 
+
+start cli
+client/trino-cli/target/trino-cli-*-executable.jar --debug
+
+
+
+delete all targets for clean compile
+
+find . -type d -name "target*" -exec rm -r {} \;
